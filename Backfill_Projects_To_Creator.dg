@@ -1,0 +1,410 @@
+void test1()
+{
+// ══════════════════════════════════════════════════════
+// Function: Backfill_Projects_To_Creator
+// Purpose:  Bulk sync 300 Zoho Projects records per run
+//           (3 pages × 100) into Zoho Creator
+// ──────────────────────────────────────────────────────
+// HOW TO RUN:
+//   1. Set start_index = 1 for the first run
+//   2. Each run processes 300 records (3 pages × 100)
+//   3. After each run, check the log for "NEXT RUN → start_index = X"
+//   4. Set start_index to that value and run again
+//   5. Wait 5–10 minutes between runs to avoid API rate limits
+//   6. Stop when log says "No projects at index X — DONE!"
+//
+// Run schedule example:
+//   Run 1: start_index = 1      → processes records 1–300
+//   Run 2: start_index = 301    → processes records 301–600
+//   Run 3: start_index = 601    → processes records 601–900
+//   ...and so on
+// ══════════════════════════════════════════════════════
+
+// ⚠️ CONFIGURATION — Update these values before deploying:
+start_index = 1;            // ← Change this each run (see schedule above)
+portalId    = "YOUR_PORTAL_ID";  // ← Replace with your Zoho Projects Portal ID
+
+// ⚠️ Creator app configuration — update to match your setup:
+creatorOwner = "YOUR_CREATOR_APP_OWNER";  // Zoho username of the Creator app owner
+creatorApp   = "YOUR_APP_LINK_NAME";      // Link name of your Creator application
+creatorConn  = "zoho_oauth_connection";   // Connection name (update if different)
+
+records_per_page = 100;
+total_success    = 0;
+total_update     = 0;
+total_create     = 0;
+total_skip       = 0;
+total_error      = 0;
+total_fetched    = 0;
+
+page1_index = start_index;
+page2_index = start_index + 100;
+page3_index = start_index + 200;
+
+info "=== BACKFILL STARTED === From index: " + start_index;
+info "Pages: " + page1_index + " | " + page2_index + " | " + page3_index;
+
+// ════════════════════════════
+// ── PAGE 1 ──
+// ════════════════════════════
+info "── Fetching page 1 | Index: " + page1_index;
+p1_url = "https://projectsapi.zoho.com/restapi/portal/" + portalId + "/projects/?index=" + page1_index + "&range=" + records_per_page;
+p1_response = invokeurl
+[
+    url :p1_url
+    type :GET
+    connection:"project_connection"
+];
+p1_list = p1_response.get("projects");
+if(p1_list == null || p1_list.size() == 0)
+{
+    info "✅ No projects at index " + page1_index + " — DONE!";
+}
+else
+{
+    info "   Fetched: " + p1_list.size() + " projects";
+    total_fetched = total_fetched + p1_list.size();
+    for each project in p1_list
+    {
+        proj_id_str = ifnull(project.get("id_string"), "");
+        proj_name   = ifnull(project.get("name"), "");
+        if(proj_id_str == "") { total_skip = total_skip + 1; continue; }
+        // ── Build custom fields map ──
+        cfMap = Map();
+        customFields = project.get("custom_fields");
+        if(customFields != null)
+        {
+            for each cf in customFields
+            {
+                for each k in cf.keys() { cfMap.put(k, cf.get(k)); }
+            }
+        }
+        // ── Extract fields — update names to match your Zoho Projects custom fields ──
+        proj_status       = ifnull(project.get("custom_status_name"), "");
+        proj_owner        = ifnull(project.get("owner_name"), "");
+        proj_email        = ifnull(project.get("owner_email"), "");
+        customer_name     = ifnull(cfMap.get("Customer"), "");
+        engine_name       = ifnull(cfMap.get("Engine Name"), "");
+        location_name     = ifnull(cfMap.get("Location Name"), "");
+        invoice_status    = ifnull(cfMap.get("Invoice Status"), "");
+        sale_order_total  = ifnull(cfMap.get("Sale Order Total"), "");
+        invoiced_date_raw = ifnull(cfMap.get("Invoiced Date"), "");
+        test_type_raw     = ifnull(cfMap.get("Test Type"), "");
+        // ── Strip HTML from rich-text fields ──
+        test_type = test_type_raw.replaceAll("<div>","").replaceAll("</div>","").replaceAll("<br>","").replaceAll("</br>","").replaceAll("<br/>","").trim();
+        // ── Date conversions (MM-dd-yyyy → dd-MMM-yyyy) ──
+        proj_start = ""; proj_end = ""; invoiced_date = "";
+        proj_start_raw = ifnull(project.get("start_date"), "");
+        proj_end_raw   = ifnull(project.get("end_date"), "");
+        if(proj_start_raw != "") { proj_start = proj_start_raw.toDate("MM-dd-yyyy").toString("dd-MMM-yyyy"); }
+        if(proj_end_raw != "")   { proj_end   = proj_end_raw.toDate("MM-dd-yyyy").toString("dd-MMM-yyyy"); }
+        if(invoiced_date_raw != "") { invoiced_date = invoiced_date_raw.toDate("MM-dd-yyyy").toString("dd-MMM-yyyy"); }
+        // ── Build Creator field map — update field link names to match your Creator form ──
+        project_map = Map();
+        project_map.put("Project_Name",proj_name);
+        project_map.put("Project_Id",proj_id_str);
+        project_map.put("Status",proj_status);
+        project_map.put("Start_Date",proj_start);
+        project_map.put("End_Date",proj_end);
+        project_map.put("Owner",proj_owner);
+        project_map.put("Owner_Email",proj_email);
+        project_map.put("Test_Type",test_type);
+        project_map.put("Invoice_Status1",invoice_status);
+        project_map.put("Total_Invoice_amount",sale_order_total);
+        project_map.put("Invoiced_date",invoiced_date);
+        project_map.put("Engine", engine_name);
+        project_map.put("Location", location_name);
+        // ── Client lookup: 3-strategy fuzzy match → auto-create if not found ──
+        if(customer_name != "")
+        {
+            client_id_found = "";
+            r1 = zoho.creator.getRecords(creatorOwner,creatorApp,"Contacts_for_Admins","Name == \"" + customer_name + "\"",1,1,creatorConn);
+            if(r1.get("code") == 3000 && r1.get("data").size() > 0) { client_id_found = r1.get("data").get(0).get("ID").toString(); }
+            if(client_id_found == "")
+            {
+                r2 = zoho.creator.getRecords(creatorOwner,creatorApp,"Contacts_for_Admins","Name contains \"" + customer_name + "\"",1,1,creatorConn);
+                if(r2.get("code") == 3000 && r2.get("data").size() > 0) { client_id_found = r2.get("data").get(0).get("ID").toString(); }
+            }
+            if(client_id_found == "")
+            {
+                prefix_len = 10;
+                if(customer_name.length() < 10) { prefix_len = customer_name.length(); }
+                name_prefix = customer_name.subString(0, prefix_len);
+                r3 = zoho.creator.getRecords(creatorOwner,creatorApp,"Contacts_for_Admins","Name starts with \"" + name_prefix + "\"",1,1,creatorConn);
+                if(r3.get("code") == 3000 && r3.get("data").size() > 0) { client_id_found = r3.get("data").get(0).get("ID").toString(); }
+            }
+            if(client_id_found != "")
+            {
+                project_map.put("Client", client_id_found.toLong());
+            }
+            else
+            {
+                new_client_map = Map();
+                new_client_map.put("Name", customer_name);
+                create_client = zoho.creator.createRecord(creatorOwner,creatorApp,"Add_Contact",new_client_map,Map(),creatorConn);
+                if(create_client.get("code") == 3000) { project_map.put("Client", create_client.get("data").get("ID").toLong()); }
+                else { info "⚠️ Client not linked: " + customer_name; }
+            }
+        }
+        // ── Upsert: update if exists, create if not ──
+        other_params = Map();
+        proj_filter = "Project_Id == \"" + proj_id_str + "\"";
+        search = zoho.creator.getRecords(creatorOwner,creatorApp,"Projects_for_Admins",proj_filter,1,1,creatorConn);
+        if(search.get("code") == 3000 && search.get("data").size() > 0)
+        {
+            creator_rec_id = search.get("data").get(0).get("ID");
+            upd = zoho.creator.updateRecord(creatorOwner,creatorApp,"Projects_for_Admins",creator_rec_id.toLong(),project_map,other_params,creatorConn);
+            if(upd.get("code") == 3000) { total_update = total_update + 1; total_success = total_success + 1; info "✅ UPDATED [" + proj_id_str + "] Engine: " + engine_name + " | Location: " + location_name; }
+            else { total_error = total_error + 1; info "❌ UPDATE ERROR [" + proj_id_str + "] | " + upd; }
+        }
+        else
+        {
+            crt = zoho.creator.createRecord(creatorOwner,creatorApp,"Schedule_A_Project_Release",project_map,other_params,creatorConn);
+            if(crt.get("code") == 3000) { total_create = total_create + 1; total_success = total_success + 1; info "✅ CREATED [" + proj_id_str + "] " + proj_name; }
+            else { total_error = total_error + 1; info "❌ CREATE ERROR [" + proj_id_str + "] | " + crt; }
+        }
+    }
+}
+
+// ════════════════════════════
+// ── PAGE 2 ──
+// ════════════════════════════
+info "── Fetching page 2 | Index: " + page2_index;
+p2_url = "https://projectsapi.zoho.com/restapi/portal/" + portalId + "/projects/?index=" + page2_index + "&range=" + records_per_page;
+p2_response = invokeurl
+[
+    url :p2_url
+    type :GET
+    connection:"project_connection"
+];
+p2_list = p2_response.get("projects");
+if(p2_list == null || p2_list.size() == 0)
+{
+    info "✅ No projects at index " + page2_index + " — DONE!";
+}
+else
+{
+    info "   Fetched: " + p2_list.size() + " projects";
+    total_fetched = total_fetched + p2_list.size();
+    for each project in p2_list
+    {
+        proj_id_str = ifnull(project.get("id_string"), "");
+        proj_name   = ifnull(project.get("name"), "");
+        if(proj_id_str == "") { total_skip = total_skip + 1; continue; }
+        cfMap = Map();
+        customFields = project.get("custom_fields");
+        if(customFields != null)
+        {
+            for each cf in customFields
+            {
+                for each k in cf.keys() { cfMap.put(k, cf.get(k)); }
+            }
+        }
+        proj_status       = ifnull(project.get("custom_status_name"), "");
+        proj_owner        = ifnull(project.get("owner_name"), "");
+        proj_email        = ifnull(project.get("owner_email"), "");
+        customer_name     = ifnull(cfMap.get("Customer"), "");
+        engine_name       = ifnull(cfMap.get("Engine Name"), "");
+        location_name     = ifnull(cfMap.get("Location Name"), "");
+        invoice_status    = ifnull(cfMap.get("Invoice Status"), "");
+        sale_order_total  = ifnull(cfMap.get("Sale Order Total"), "");
+        invoiced_date_raw = ifnull(cfMap.get("Invoiced Date"), "");
+        test_type_raw     = ifnull(cfMap.get("Test Type"), "");
+        test_type = test_type_raw.replaceAll("<div>","").replaceAll("</div>","").replaceAll("<br>","").replaceAll("</br>","").replaceAll("<br/>","").trim();
+        proj_start = ""; proj_end = ""; invoiced_date = "";
+        proj_start_raw = ifnull(project.get("start_date"), "");
+        proj_end_raw   = ifnull(project.get("end_date"), "");
+        if(proj_start_raw != "") { proj_start = proj_start_raw.toDate("MM-dd-yyyy").toString("dd-MMM-yyyy"); }
+        if(proj_end_raw != "")   { proj_end   = proj_end_raw.toDate("MM-dd-yyyy").toString("dd-MMM-yyyy"); }
+        if(invoiced_date_raw != "") { invoiced_date = invoiced_date_raw.toDate("MM-dd-yyyy").toString("dd-MMM-yyyy"); }
+        project_map = Map();
+        project_map.put("Project_Name",proj_name);
+        project_map.put("Project_Id",proj_id_str);
+        project_map.put("Status",proj_status);
+        project_map.put("Start_Date",proj_start);
+        project_map.put("End_Date",proj_end);
+        project_map.put("Owner",proj_owner);
+        project_map.put("Owner_Email",proj_email);
+        project_map.put("Test_Type",test_type);
+        project_map.put("Invoice_Status1",invoice_status);
+        project_map.put("Total_Invoice_amount",sale_order_total);
+        project_map.put("Invoiced_date",invoiced_date);
+        project_map.put("Engine", engine_name);
+        project_map.put("Location", location_name);
+        if(customer_name != "")
+        {
+            client_id_found = "";
+            r1 = zoho.creator.getRecords(creatorOwner,creatorApp,"Contacts_for_Admins","Name == \"" + customer_name + "\"",1,1,creatorConn);
+            if(r1.get("code") == 3000 && r1.get("data").size() > 0) { client_id_found = r1.get("data").get(0).get("ID").toString(); }
+            if(client_id_found == "")
+            {
+                r2 = zoho.creator.getRecords(creatorOwner,creatorApp,"Contacts_for_Admins","Name contains \"" + customer_name + "\"",1,1,creatorConn);
+                if(r2.get("code") == 3000 && r2.get("data").size() > 0) { client_id_found = r2.get("data").get(0).get("ID").toString(); }
+            }
+            if(client_id_found == "")
+            {
+                prefix_len = 10;
+                if(customer_name.length() < 10) { prefix_len = customer_name.length(); }
+                name_prefix = customer_name.subString(0, prefix_len);
+                r3 = zoho.creator.getRecords(creatorOwner,creatorApp,"Contacts_for_Admins","Name starts with \"" + name_prefix + "\"",1,1,creatorConn);
+                if(r3.get("code") == 3000 && r3.get("data").size() > 0) { client_id_found = r3.get("data").get(0).get("ID").toString(); }
+            }
+            if(client_id_found != "")
+            {
+                project_map.put("Client", client_id_found.toLong());
+            }
+            else
+            {
+                new_client_map = Map();
+                new_client_map.put("Name", customer_name);
+                create_client = zoho.creator.createRecord(creatorOwner,creatorApp,"Add_Contact",new_client_map,Map(),creatorConn);
+                if(create_client.get("code") == 3000) { project_map.put("Client", create_client.get("data").get("ID").toLong()); }
+                else { info "⚠️ Client not linked: " + customer_name; }
+            }
+        }
+        other_params = Map();
+        proj_filter = "Project_Id == \"" + proj_id_str + "\"";
+        search = zoho.creator.getRecords(creatorOwner,creatorApp,"Projects_for_Admins",proj_filter,1,1,creatorConn);
+        if(search.get("code") == 3000 && search.get("data").size() > 0)
+        {
+            creator_rec_id = search.get("data").get(0).get("ID");
+            upd = zoho.creator.updateRecord(creatorOwner,creatorApp,"Projects_for_Admins",creator_rec_id.toLong(),project_map,other_params,creatorConn);
+            if(upd.get("code") == 3000) { total_update = total_update + 1; total_success = total_success + 1; info "✅ UPDATED [" + proj_id_str + "] Engine: " + engine_name + " | Location: " + location_name; }
+            else { total_error = total_error + 1; info "❌ UPDATE ERROR [" + proj_id_str + "] | " + upd; }
+        }
+        else
+        {
+            crt = zoho.creator.createRecord(creatorOwner,creatorApp,"Schedule_A_Project_Release",project_map,other_params,creatorConn);
+            if(crt.get("code") == 3000) { total_create = total_create + 1; total_success = total_success + 1; info "✅ CREATED [" + proj_id_str + "] " + proj_name; }
+            else { total_error = total_error + 1; info "❌ CREATE ERROR [" + proj_id_str + "] | " + crt; }
+        }
+    }
+}
+
+// ════════════════════════════
+// ── PAGE 3 ──
+// ════════════════════════════
+info "── Fetching page 3 | Index: " + page3_index;
+p3_url = "https://projectsapi.zoho.com/restapi/portal/" + portalId + "/projects/?index=" + page3_index + "&range=" + records_per_page;
+p3_response = invokeurl
+[
+    url :p3_url
+    type :GET
+    connection:"project_connection"
+];
+p3_list = p3_response.get("projects");
+if(p3_list == null || p3_list.size() == 0)
+{
+    info "✅ No projects at index " + page3_index + " — DONE!";
+}
+else
+{
+    info "   Fetched: " + p3_list.size() + " projects";
+    total_fetched = total_fetched + p3_list.size();
+    for each project in p3_list
+    {
+        proj_id_str = ifnull(project.get("id_string"), "");
+        proj_name   = ifnull(project.get("name"), "");
+        if(proj_id_str == "") { total_skip = total_skip + 1; continue; }
+        cfMap = Map();
+        customFields = project.get("custom_fields");
+        if(customFields != null)
+        {
+            for each cf in customFields
+            {
+                for each k in cf.keys() { cfMap.put(k, cf.get(k)); }
+            }
+        }
+        proj_status       = ifnull(project.get("custom_status_name"), "");
+        proj_owner        = ifnull(project.get("owner_name"), "");
+        proj_email        = ifnull(project.get("owner_email"), "");
+        customer_name     = ifnull(cfMap.get("Customer"), "");
+        engine_name       = ifnull(cfMap.get("Engine Name"), "");
+        location_name     = ifnull(cfMap.get("Location Name"), "");
+        invoice_status    = ifnull(cfMap.get("Invoice Status"), "");
+        sale_order_total  = ifnull(cfMap.get("Sale Order Total"), "");
+        invoiced_date_raw = ifnull(cfMap.get("Invoiced Date"), "");
+        test_type_raw     = ifnull(cfMap.get("Test Type"), "");
+        test_type = test_type_raw.replaceAll("<div>","").replaceAll("</div>","").replaceAll("<br>","").replaceAll("</br>","").replaceAll("<br/>","").trim();
+        proj_start = ""; proj_end = ""; invoiced_date = "";
+        proj_start_raw = ifnull(project.get("start_date"), "");
+        proj_end_raw   = ifnull(project.get("end_date"), "");
+        if(proj_start_raw != "") { proj_start = proj_start_raw.toDate("MM-dd-yyyy").toString("dd-MMM-yyyy"); }
+        if(proj_end_raw != "")   { proj_end   = proj_end_raw.toDate("MM-dd-yyyy").toString("dd-MMM-yyyy"); }
+        if(invoiced_date_raw != "") { invoiced_date = invoiced_date_raw.toDate("MM-dd-yyyy").toString("dd-MMM-yyyy"); }
+        project_map = Map();
+        project_map.put("Project_Name",proj_name);
+        project_map.put("Project_Id",proj_id_str);
+        project_map.put("Status",proj_status);
+        project_map.put("Start_Date",proj_start);
+        project_map.put("End_Date",proj_end);
+        project_map.put("Owner",proj_owner);
+        project_map.put("Owner_Email",proj_email);
+        project_map.put("Test_Type",test_type);
+        project_map.put("Invoice_Status1",invoice_status);
+        project_map.put("Total_Invoice_amount",sale_order_total);
+        project_map.put("Invoiced_date",invoiced_date);
+        project_map.put("Engine", engine_name);
+        project_map.put("Location", location_name);
+        if(customer_name != "")
+        {
+            client_id_found = "";
+            r1 = zoho.creator.getRecords(creatorOwner,creatorApp,"Contacts_for_Admins","Name == \"" + customer_name + "\"",1,1,creatorConn);
+            if(r1.get("code") == 3000 && r1.get("data").size() > 0) { client_id_found = r1.get("data").get(0).get("ID").toString(); }
+            if(client_id_found == "")
+            {
+                r2 = zoho.creator.getRecords(creatorOwner,creatorApp,"Contacts_for_Admins","Name contains \"" + customer_name + "\"",1,1,creatorConn);
+                if(r2.get("code") == 3000 && r2.get("data").size() > 0) { client_id_found = r2.get("data").get(0).get("ID").toString(); }
+            }
+            if(client_id_found == "")
+            {
+                prefix_len = 10;
+                if(customer_name.length() < 10) { prefix_len = customer_name.length(); }
+                name_prefix = customer_name.subString(0, prefix_len);
+                r3 = zoho.creator.getRecords(creatorOwner,creatorApp,"Contacts_for_Admins","Name starts with \"" + name_prefix + "\"",1,1,creatorConn);
+                if(r3.get("code") == 3000 && r3.get("data").size() > 0) { client_id_found = r3.get("data").get(0).get("ID").toString(); }
+            }
+            if(client_id_found != "")
+            {
+                project_map.put("Client", client_id_found.toLong());
+            }
+            else
+            {
+                new_client_map = Map();
+                new_client_map.put("Name", customer_name);
+                create_client = zoho.creator.createRecord(creatorOwner,creatorApp,"Add_Contact",new_client_map,Map(),creatorConn);
+                if(create_client.get("code") == 3000) { project_map.put("Client", create_client.get("data").get("ID").toLong()); }
+                else { info "⚠️ Client not linked: " + customer_name; }
+            }
+        }
+        other_params = Map();
+        proj_filter = "Project_Id == \"" + proj_id_str + "\"";
+        search = zoho.creator.getRecords(creatorOwner,creatorApp,"Projects_for_Admins",proj_filter,1,1,creatorConn);
+        if(search.get("code") == 3000 && search.get("data").size() > 0)
+        {
+            creator_rec_id = search.get("data").get(0).get("ID");
+            upd = zoho.creator.updateRecord(creatorOwner,creatorApp,"Projects_for_Admins",creator_rec_id.toLong(),project_map,other_params,creatorConn);
+            if(upd.get("code") == 3000) { total_update = total_update + 1; total_success = total_success + 1; info "✅ UPDATED [" + proj_id_str + "] Engine: " + engine_name + " | Location: " + location_name; }
+            else { total_error = total_error + 1; info "❌ UPDATE ERROR [" + proj_id_str + "] | " + upd; }
+        }
+        else
+        {
+            crt = zoho.creator.createRecord(creatorOwner,creatorApp,"Schedule_A_Project_Release",project_map,other_params,creatorConn);
+            if(crt.get("code") == 3000) { total_create = total_create + 1; total_success = total_success + 1; info "✅ CREATED [" + proj_id_str + "] " + proj_name; }
+            else { total_error = total_error + 1; info "❌ CREATE ERROR [" + proj_id_str + "] | " + crt; }
+        }
+    }
+}
+
+// ══════════════════════════════════════════
+// ── FINAL SUMMARY ──
+// ══════════════════════════════════════════
+next_index = start_index + 300;
+info "=== BACKFILL BATCH COMPLETE ===";
+info "Started at index  : " + start_index;
+info "Total fetched     : " + total_fetched;
+info "✅ Success        : " + total_success + " (Updates: " + total_update + " | Creates: " + total_create + ")";
+info "⏭️ Skipped        : " + total_skip;
+info "❌ Errors         : " + total_error;
+info "▶️ NEXT RUN → start_index = " + next_index;
+}
